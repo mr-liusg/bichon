@@ -70,7 +70,7 @@ use tantivy::{
     indexer::{LogMergePolicy, UserOperation},
     query::{AllQuery, BooleanQuery, EmptyQuery, Occur, Query, QueryParser, RangeQuery, TermQuery},
     schema::{IndexRecordOption, Value},
-    DocAddress, Index, IndexReader, IndexWriter, Order, TantivyDocument, Term,
+    DocAddress, Index, IndexReader, IndexWriter, Order, ReloadPolicy, TantivyDocument, Term,
 };
 use tantivy::{schema::Facet, Searcher};
 use tokio::{
@@ -124,12 +124,22 @@ impl IndexManager {
             });
         index_writer.set_merge_policy(Box::new(merge_policy));
         let index_writer = Arc::new(Mutex::new(index_writer));
-        let reader = index.reader().unwrap_or_else(|e| {
-            panic!(
-                "Failed to create IndexReader for {:?}: {}",
-                &DATA_DIR_MANAGER.envelope_dir, e
-            )
-        });
+        // Use Manual reload policy: the default `OnCommitWithDelay` registers a directory
+        // watch that auto-reloads the reader after every commit. Under high-frequency
+        // commits (background ingest) this can spiral into a reload storm where the watch
+        // thread spins re-reading meta.json, starving the writer and stalling ingestion.
+        // All read paths here reload explicitly via `create_searcher()` (or inline), so a
+        // Manual policy is sufficient and avoids the storm.
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()
+            .unwrap_or_else(|e| {
+                panic!(
+                    "Failed to create IndexReader for {:?}: {}",
+                    &DATA_DIR_MANAGER.envelope_dir, e
+                )
+            });
 
         let (sender, mut receiver) = mpsc::channel::<TantivyDocument>(100);
 
@@ -144,9 +154,9 @@ impl IndexManager {
                     maybe_msg = receiver.recv() => {
                         match maybe_msg {
                             Some(doc) => {
-                                let mut writer = writer.lock().await;
+                                let writer_guard = writer.lock().await;
                                 let mut batch_count = 0;
-                                match writer.add_document(doc) {
+                                match writer_guard.add_document(doc) {
                                     Ok(_) => {
                                         batch_count += 1;
                                     }
@@ -156,7 +166,7 @@ impl IndexManager {
                                     }
                                 }
                                 while let Ok(next_doc) = receiver.try_recv() {
-                                    match writer.add_document(next_doc) {
+                                    match writer_guard.add_document(next_doc) {
                                         Ok(_) => batch_count += 1,
                                         Err(e) => {
                                             eprintln!("[ERROR] Failed to add document: {e:?}");
@@ -167,12 +177,31 @@ impl IndexManager {
                                 if batch_count > 0 {
                                     pending_count += batch_count;
                                 }
+                                // Release the writer lock before potentially committing: the commit
+                                // is offloaded to `spawn_blocking` (see below) which re-acquires the
+                                // lock via `blocking_lock`. The async guard borrows the `Mutex` and
+                                // cannot cross the `'static` spawn_blocking boundary, and dropping it
+                                // here also shortens the lock-held window.
+                                drop(writer_guard);
                                 if pending_count >= commit_threshold {
                                     tracing::info!(
                                         "Tantivy: Reached threshold ({} docs), committing...",
                                         pending_count
                                     );
-                                    tokio::task::block_in_place(|| fatal_commit(&mut writer));
+                                    // Offload the (potentially merge-heavy, synchronous) commit to a
+                                    // dedicated blocking thread instead of `block_in_place`. The
+                                    // latter pins the tokio worker thread for the whole commit+merge,
+                                    // starving the runtime scheduler; `spawn_blocking` keeps the
+                                    // runtime responsive so the commit can actually complete.
+                                    let w = writer.clone();
+                                    task::spawn_blocking(move || {
+                                        fatal_commit(&mut w.blocking_lock());
+                                    })
+                                    .await
+                                    .unwrap_or_else(|e| {
+                                        tracing::error!("Tantivy commit task panicked: {e:?}");
+                                        panic!("Tantivy commit task panicked: {e:?}");
+                                    });
                                     tracing::debug!(
                                         "Tantivy: committed {} docs, pending reset to 0",
                                         pending_count
@@ -184,8 +213,12 @@ impl IndexManager {
                             None => {
                                 tracing::info!("Tantivy: Receiver closed. Finalizing...");
                                 if pending_count > 0 {
-                                    let mut writer = writer.lock().await;
-                                    tokio::task::block_in_place(|| fatal_commit(&mut writer));
+                                    let w = writer.clone();
+                                    task::spawn_blocking(move || {
+                                        fatal_commit(&mut w.blocking_lock());
+                                    })
+                                    .await
+                                    .ok();
                                 }
                                 break;
                             },
@@ -193,20 +226,28 @@ impl IndexManager {
                     }
                     _ = commit_interval.tick() => {
                         if pending_count > 0 {
-                            let mut writer = writer.lock().await;
                             tracing::debug!(
                                 "Tantivy: periodic commit ({} docs pending)",
                                 pending_count
                             );
-                            tokio::task::block_in_place(|| fatal_commit(&mut writer));
+                            let w = writer.clone();
+                            task::spawn_blocking(move || {
+                                fatal_commit(&mut w.blocking_lock());
+                            })
+                            .await
+                            .ok();
                             pending_count = 0;
                         }
                     }
                     _ = shutdown.recv() => {
                         tracing::info!("Tantivy: Shutdown signal received. Performing final commit...");
                         if pending_count > 0 {
-                            let mut writer = writer.lock().await;
-                            tokio::task::block_in_place(|| fatal_commit(&mut writer));
+                            let w = writer.clone();
+                            task::spawn_blocking(move || {
+                                fatal_commit(&mut w.blocking_lock());
+                            })
+                            .await
+                            .ok();
                         }
                         tracing::info!("Tantivy: Shutdown cleanup complete.");
                         break;
@@ -1148,6 +1189,11 @@ impl IndexManager {
     }
 
     pub fn get_all_tags(&self, accounts: Option<HashSet<u64>>) -> BichonResult<Vec<TagCount>> {
+        // Reload before searching: the shared reader uses `ReloadPolicy::Manual`, so without
+        // an explicit reload here newly committed tag changes would not be visible.
+        self.reader
+            .reload()
+            .map_err(|e| raise_error!(format!("{:#?}", e), ErrorCode::InternalError))?;
         let searcher = self.reader.searcher();
 
         let query: Box<dyn Query> = match accounts {

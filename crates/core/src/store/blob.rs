@@ -26,7 +26,7 @@ use crate::raise_error;
 use bytes::Bytes;
 use fjall::{CompressionType, Database, Keyspace, KeyspaceCreateOptions, KvSeparationOptions, config::{BlockSizePolicy, CompressionPolicy}};
 
-use std::{io::Cursor, sync::LazyLock};
+use std::{io::Cursor, sync::LazyLock, time::Duration};
 use tokio::{
     sync::{mpsc, Mutex},
     task::{self, JoinHandle},
@@ -69,7 +69,7 @@ impl BlobManager {
             }
             Err(e) => tracing::error!("Fjall email_ks error: {:?}", e),
             Ok(true) => {
-                tracing::debug!("Email blob already exists (dedup): {}", &email_hash);
+                tracing::debug!("Email blob already exists (dedup)");
             }
         }
 
@@ -83,8 +83,55 @@ impl BlobManager {
                     }
                     Err(e) => tracing::error!("Fjall attach_ks error: {:?}", e),
                     Ok(true) => {
-                        tracing::debug!("Attachment blob already exists (dedup): {}", &a_hash);
+                        tracing::debug!("Attachment blob already exists (dedup)");
                     }
+                }
+            }
+        }
+    }
+
+    /// Proactively compacts a keyspace when its L0 table count approaches fjall's
+    /// write-halt threshold.
+    ///
+    /// fjall halts writes (`check_write_halt` busy-waits once `l0_run_count >= 30`)
+    /// and only compacts as a side effect of memtable rotation triggered by *new*
+    /// writes. With kv-separated, randomly-keyed blob values, each memtable flush
+    /// produces a small, overlapping L0 table that Leveled compaction struggles to
+    /// merge, so L0 can accumulate past 30 during a burst import — at which point
+    /// the very next `insert` stalls forever in `check_write_halt`, deadlocking the
+    /// writer (no new writes => no rotation => no compaction => no recovery).
+    ///
+    /// This breaks the deadlock by compacting *before* the threshold is hit. The
+    /// `major_compact` call is synchronous and runs on a `spawn_blocking` thread,
+    /// so it never blocks the async runtime.
+    fn maybe_compact(ks: &Keyspace, name: &str) {
+        // 15 leaves a comfortable margin below the hard halt at 30. Reading the
+        // count is cheap (in-memory version lookup).
+        const COMPACT_TRIGGER: usize = 15;
+        let l0 = ks.l0_table_count();
+        if l0 >= COMPACT_TRIGGER {
+            tracing::info!(
+                "BlobManager: keyspace {} L0 table count = {} >= {}, triggering major_compact",
+                name,
+                l0,
+                COMPACT_TRIGGER
+            );
+            let start = std::time::Instant::now();
+            match ks.major_compact() {
+                Ok(()) => {
+                    tracing::info!(
+                        "BlobManager: keyspace {} major_compact done in {:?}, L0 now = {}",
+                        name,
+                        start.elapsed(),
+                        ks.l0_table_count()
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "BlobManager: keyspace {} major_compact failed: {:?}",
+                        name,
+                        e
+                    );
                 }
             }
         }
@@ -96,6 +143,13 @@ impl BlobManager {
         .max_cached_files(Some(400))
         .journal_compression(CompressionType::None)
         .max_journaling_size(64 * 1024 * 1024)
+        // More compaction/flush workers than the default min(CPU, 4). Under bursty
+        // blob writes (e.g. EML batch import) the default 4 workers cannot keep L0
+        // compacted fast enough; once `l0_run_count >= 30` fjall's `check_write_halt`
+        // busy-waits inside `Keyspace::insert`, which blocks the BlobManager's
+        // spawn_blocking task, fills the blob channel, and stalls the whole import.
+        // Doubling the workers lets compaction keep pace with ingest.
+        .worker_threads(8)
             .open()
             .expect("Failed to initialize Fjall database: Check if the directory exists and has write permissions.");
 
@@ -144,6 +198,25 @@ impl BlobManager {
         let attach_ks = attachments_keyspace.clone();
         let handler = task::spawn(async move {
             let mut shutdown = SIGNAL_MANAGER.subscribe();
+
+            // Trigger an initial compaction pass to digest any L0 backlog left from a
+            // previous run. fjall's compaction is write-driven: it only runs as a side
+            // effect of memtable rotation/flush, which only happens on new writes. An
+            // idle keyspace with a large L0 backlog (e.g. 70 fragmented tables from a
+            // prior import) would never be compacted on its own, and the very next
+            // `insert` would hit `check_write_halt` (`l0_run_count >= 30` busy-wait)
+            // before any compaction could run — deadlocking the writer. We compact
+            // proactively so writes never stall.
+            {
+                let email_ks = email_ks.clone();
+                let attach_ks = attach_ks.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    Self::maybe_compact(&email_ks, "email");
+                    Self::maybe_compact(&attach_ks, "attachments");
+                })
+                .await;
+            }
+
             loop {
                 tokio::select! {
                     res = receiver.recv() => {
@@ -159,6 +232,12 @@ impl BlobManager {
                                     for eml in batch {
                                         Self::process_detached_email(eml, &email_ks, &attach_ks);
                                     }
+                                    // After ingesting a batch, proactively compact if L0 is
+                                    // building up. This keeps `l0_run_count` well below the
+                                    // write-halt threshold (30) so subsequent inserts never
+                                    // stall in `check_write_halt`.
+                                    Self::maybe_compact(&email_ks, "email");
+                                    Self::maybe_compact(&attach_ks, "attachments");
                                 }).await {
                                     tracing::error!("BlobManager: spawn_blocking join error: {:#?}", e);
                                 }
@@ -206,9 +285,27 @@ impl BlobManager {
         }
     }
 
+    /// Queues a detached email for asynchronous blob storage.
+    ///
+    /// The send is bounded by a timeout so that a stuck background task (e.g. fjall's
+    /// `check_write_halt` busy-waiting inside `Keyspace::insert` when L0 accumulates)
+    /// cannot stall the caller indefinitely. If the blob channel stays full beyond the
+    /// timeout, the blob is dropped with an error log; the email is still indexed, and
+    /// the missing original content is later recovered on demand via the self-healing
+    /// path (`reattach_eml_content_self_healing`), which re-fetches from IMAP.
     pub async fn queue(&self, email: DetachedEmail) {
-        if let Err(e) = self.sender.send(email).await {
-          tracing::error!("BlobManager channel closed, email lost: {:#?}", e);
+        match tokio::time::timeout(Duration::from_secs(30), self.sender.send(email)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::error!("BlobManager channel closed, email blob lost: {:#?}", e);
+            }
+            Err(_) => {
+                tracing::error!(
+                    "BlobManager queue timeout (30s): background blob writer is stuck \
+                     (likely fjall write-halt). Dropping this blob; original email content \
+                     will be re-fetched on demand via self-healing."
+                );
+            }
         }
     }
 
