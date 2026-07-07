@@ -26,7 +26,7 @@ use crate::raise_error;
 use bytes::Bytes;
 use fjall::{CompressionType, Database, Keyspace, KeyspaceCreateOptions, KvSeparationOptions, config::{BlockSizePolicy, CompressionPolicy}};
 
-use std::{io::Cursor, sync::LazyLock, time::Duration};
+use std::{io::Cursor, sync::LazyLock};
 use tokio::{
     sync::{mpsc, Mutex},
     task::{self, JoinHandle},
@@ -90,23 +90,25 @@ impl BlobManager {
         }
     }
 
-    /// Proactively compacts a keyspace when its L0 table count approaches fjall's
-    /// write-halt threshold.
+    /// Proactively compacts a keyspace when its L0 table count is already high, as
+    /// insurance against a write-halt. Used **only at startup** to digest any L0
+    /// backlog left from a previous (crashed / busy) run.
     ///
-    /// fjall halts writes (`check_write_halt` busy-waits once `l0_run_count >= 30`)
-    /// and only compacts as a side effect of memtable rotation triggered by *new*
-    /// writes. With kv-separated, randomly-keyed blob values, each memtable flush
-    /// produces a small, overlapping L0 table that Leveled compaction struggles to
-    /// merge, so L0 can accumulate past 30 during a burst import — at which point
-    /// the very next `insert` stalls forever in `check_write_halt`, deadlocking the
-    /// writer (no new writes => no rotation => no compaction => no recovery).
+    /// fjall's compaction is driven by memtable rotation and ingestion: it runs as a
+    /// side effect of flush, never on an idle tree. An idle keyspace that was shut
+    /// down with a large L0 backlog (e.g. 70 fragmented tables from a prior import)
+    /// would never be compacted on its own, and the very next `insert` could hit
+    /// `check_write_halt` (`l0_run_count >= 30` busy-wait) before any compaction ran.
     ///
-    /// This breaks the deadlock by compacting *before* the threshold is hit. The
-    /// `major_compact` call is synchronous and runs on a `spawn_blocking` thread,
-    /// so it never blocks the async runtime.
+    /// Steady-state L0 bounding is handled by the sized memtable/journal (fewer, larger
+    /// flushes) plus fjall's own leveled compaction, so we do *not* run a full
+    /// `major_compact` after every batch — that would rewrite the whole tree on a
+    /// fixed L0-table cadence and scale poorly as the archive grows. This startup pass
+    /// is the only place we force a compaction, and it runs on a `spawn_blocking`
+    /// thread so it never blocks the async runtime.
     fn maybe_compact(ks: &Keyspace, name: &str) {
-        // 15 leaves a comfortable margin below the hard halt at 30. Reading the
-        // count is cheap (in-memory version lookup).
+        // Only act on an already-large backlog; below this the normal leveled
+        // compaction keeps up. Reading the count is cheap (in-memory version lookup).
         const COMPACT_TRIGGER: usize = 15;
         let l0 = ks.l0_table_count();
         if l0 >= COMPACT_TRIGGER {
@@ -142,7 +144,13 @@ impl BlobManager {
         .cache_size(64 * 1024 * 1024)
         .max_cached_files(Some(400))
         .journal_compression(CompressionType::None)
-        .max_journaling_size(64 * 1024 * 1024)
+        // The journal (WAL) is rotated when it exceeds this size, and each rotation
+        // forces a memtable flush => one (small, overlapping, randomly-keyed) L0 table.
+        // Blob values average ~18 MB (email) / ~33 MB (attachment), so a 64 MiB journal
+        // rotates after just a few inserts, flooding L0 and risking fjall's write-halt
+        // (busy-wait once `l0_run_count >= 30`). Use the default-sized journal so flushes
+        // are driven by memtable rotation (which we also batch up below), not the WAL.
+        .max_journaling_size(512 * 1024 * 1024)
         // More compaction/flush workers than the default min(CPU, 4). Under bursty
         // blob writes (e.g. EML batch import) the default 4 workers cannot keep L0
         // compacted fast enough; once `l0_run_count >= 30` fjall's `check_write_halt`
@@ -157,7 +165,19 @@ impl BlobManager {
         let email_keyspace = db
             .keyspace("email", || {
                 KeyspaceCreateOptions::default()
-                .max_memtable_size(16 * 1024 * 1024)
+                // kv-separation writes the value to a blob file only at *flush* time, so the
+                // active memtable holds each full blob value until rotation. A 16 MiB memtable
+                // rotates after roughly one average email (~18 MB), producing a tiny L0 table
+                // per message — the direct cause of L0 accumulating toward the write-halt
+                // threshold. Batching several blobs per memtable (here ~256 MiB) cuts the L0
+                // flush rate by an order of magnitude. The global write buffer is unbounded by
+                // default, so this only raises peak memory, not a hard cap.
+                //
+                // NOTE: `max_memtable_size` is persisted in the keyspace's config kv and
+                // restored from disk on recovery, so this value takes effect only for a freshly
+                // created keyspace. Existing deployments keep their persisted (16 MiB) value
+                // and rely on the lightweight startup compaction below to keep L0 bounded.
+                .max_memtable_size(256 * 1024 * 1024)
                 .data_block_size_policy(BlockSizePolicy::all(4 * 1024))
                 .data_block_compression_policy(  
                     CompressionPolicy::all(CompressionType::Lz4)  
@@ -188,7 +208,7 @@ impl BlobManager {
                         .staleness_threshold(0.5)
                         .age_cutoff(0.6),
                 ))
-                .max_memtable_size(16 * 1024 * 1024)
+                .max_memtable_size(256 * 1024 * 1024)
             })
             .expect("Failed to open 'attachments' keyspace: Check disk space for blob storage initialization.");
         
@@ -232,12 +252,15 @@ impl BlobManager {
                                     for eml in batch {
                                         Self::process_detached_email(eml, &email_ks, &attach_ks);
                                     }
-                                    // After ingesting a batch, proactively compact if L0 is
-                                    // building up. This keeps `l0_run_count` well below the
-                                    // write-halt threshold (30) so subsequent inserts never
-                                    // stall in `check_write_halt`.
-                                    Self::maybe_compact(&email_ks, "email");
-                                    Self::maybe_compact(&attach_ks, "attachments");
+                                    // Steady-state L0 bounding is left to fjall's own leveled
+                                    // compaction (triggered by the flushes these inserts cause) plus
+                                    // the sized memtable/journal above. We deliberately do NOT call
+                                    // `maybe_compact` here: a per-batch `major_compact` would rewrite
+                                    // the whole tree on a fixed L0-table cadence and scale poorly as
+                                    // the archive grows. `insert` may still apply fjall's built-in
+                                    // write-stall/backpressure when L0 is busy — that is the intended
+                                    // signal to slow ingest, and `queue` below propagates it rather
+                                    // than dropping data.
                                 }).await {
                                     tracing::error!("BlobManager: spawn_blocking join error: {:#?}", e);
                                 }
@@ -287,25 +310,30 @@ impl BlobManager {
 
     /// Queues a detached email for asynchronous blob storage.
     ///
-    /// The send is bounded by a timeout so that a stuck background task (e.g. fjall's
-    /// `check_write_halt` busy-waiting inside `Keyspace::insert` when L0 accumulates)
-    /// cannot stall the caller indefinitely. If the blob channel stays full beyond the
-    /// timeout, the blob is dropped with an error log; the email is still indexed, and
-    /// the missing original content is later recovered on demand via the self-healing
-    /// path (`reattach_eml_content_self_healing`), which re-fetches from IMAP.
+    /// This applies **backpressure, not data loss**. The bounded channel (capacity 100)
+    /// blocks the caller while the background writer is busy — which is exactly the right
+    /// behaviour when fjall's compaction falls behind: ingest slows to the pace compaction
+    /// can sustain, instead of outrunning it and accumulating L0 toward a write-halt. The
+    /// caller (envelope extraction) simply awaits, so import throughput dips rather than
+    /// silently dropping blobs.
+    ///
+    /// The only non-recoverable case is the channel closing — i.e. the background writer
+    /// task itself panicked or was shut down. That is a real failure (not transient
+    /// backpressure) and is logged at `error` level. We do not time out and drop the blob:
+    /// a dropped blob is unrecoverable for imported/`NoSync` emails (no IMAP source, and
+    /// imported envelopes carry `uid == 0`), so `reattach_eml_content_self_healing` cannot
+    /// refetch them. Blocking indefinitely is preferable to silently losing mail content.
     pub async fn queue(&self, email: DetachedEmail) {
-        match tokio::time::timeout(Duration::from_secs(30), self.sender.send(email)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                tracing::error!("BlobManager channel closed, email blob lost: {:#?}", e);
-            }
-            Err(_) => {
-                tracing::error!(
-                    "BlobManager queue timeout (30s): background blob writer is stuck \
-                     (likely fjall write-halt). Dropping this blob; original email content \
-                     will be re-fetched on demand via self-healing."
-                );
-            }
+        if let Err(e) = self.sender.send(email).await {
+            // Channel closed: the writer task is gone. This should not happen during normal
+            // operation (only on a panicked writer or post-shutdown). The blob is lost; surface
+            // it loudly rather than swallowing it.
+            tracing::error!(
+                "BlobManager channel closed, email blob could not be stored: {:#?}. \
+                 The envelope is indexed but its original content is missing; for IMAP \
+                 accounts it can be re-fetched on demand, for imported/NoSync mail it is lost.",
+                e
+            );
         }
     }
 
